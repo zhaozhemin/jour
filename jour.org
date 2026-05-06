@@ -1,0 +1,1182 @@
+# -*- mode: org -*-
+#+PROPERTY: header-args:emacs-lisp :lexical t :results silent
+
+Nintendo .DS_Store (@sliminality) on [[https://x.com/sliminality/status/1336062001194229765][writing a blog post]]:
+
+#+begin_quote
+Also note that writing a blog post would require creating a blog,
+which would require writing an entire static site framework from
+scratch (probably in Haskell), which would require getting a lot
+better at Haskell and therefore this avenue would take 36 months at
+minimum
+#+end_quote
+
+So I built my own blog. But not in Haskell. (sorry Haskell, 'cause I
+don't know you and I don't have 36 months.) Actually, come to think of
+it, I'm not familiar with Elisp either…
+
+Anyway, a fun consequence of building it in Elisp is that I could use
+Org which means I could write a blog post (this is the one) about how
+I built my blog that is the source code of my blog and exactly how my
+blog is built. Now /that/ is some moderate self-reference.
+
+* HTML export backend
+
+I wrote my own export backend for three reasons. First, I want to
+fully control the HTML structure. I don't think it's possible to alter
+the structure, e.g. which Org element generates which HTML element,
+just by customizing some variables. (or maybe I just didn't bother
+with reading the docs carefully.)
+
+The second and third reasons are in the same vein. People who created
+markup languages like HTML and Org really didn't think it through when
+it comes to Asian languages. For example, in HTML, a newline character
+is treated like a space. That is natural in English where words are
+separated by spaces. Not the case with Chinese, or Japanese. If you
+write your text with hard line breaks, good luck when converting to
+HTML, because it looks terrible. A particular problem with Org is that
+inline markups are also delineated by spaces. Without special
+treatment, there will be spaces between normal text and, say, bold
+text. One common solution is to use zero-width space. It works but I
+don't like it. I like to know what's going on in my text file. If I
+see no space, there's no space. If I see a blank, well, is it a space
+or is it a tab? I'd like to know! So in a sense, what I'm looking for
+in a plaintext file is, wait for it, WYSIWYG. My solution is to remove
+the unwanted spaces and newlines during export. The backend will check
+the characters at both ends of a space or a newline character and
+remove the space if one of the characters is a CJK character.
+
+** Transformers
+
+#+begin_src emacs-lisp
+  ;; -*- lexical-binding: t -*-
+
+  (require 'ox)
+  (require 'dom)
+  (require 'cl-lib)
+
+  (org-export-define-backend 'jour-html
+    '((bold . jour-html-bold)
+      (code . jour-html-code)
+      (example-block . jour-html-example)
+      (footnote-reference . jour-html-footnote-reference)
+      (headline . jour-html-headline)
+      (horizontal-rule . jour-html-hr)
+      (italic . jour-html-italic)
+      (item . jour-html-item)
+      (line-break . jour-html-line-break)
+      (link . jour-html-link)
+      (paragraph . jour-html-paragraph)
+      (plain-list . jour-html-plain-list)
+      (plain-text . jour-html-plain-text)
+      (quote-block . jour-html-quote-block)
+      (section . jour-html-section)
+      (src-block . jour-src-block)
+      (strike-through . jour-html-strike-through)
+      (template . jour-html-template))
+    :menu-entry
+    '(?H "Export to My Custom HTML"
+         (lambda (a s v b) (org-export-to-buffer 'jour-html "*jour-html-export*"))))
+
+  (defun jour-html-bold (bold-element contents info)
+    (format "<b>%s</b>" contents))
+
+  (defun jour-html-code (code-element contents info)
+    "org-export-format-code-default will append a newline to the text."
+    (format "<code>%s</code>" (string-trim (org-export-format-code-default code-element info))))
+
+  (defun jour-html-example (example-element contents info)
+    (format "<pre>%s</pre>"
+            (org-html-encode-plain-text (org-export-format-code-default example-element info))))
+
+  (defun jour-html-footnote-reference (footnote-reference-element contents info)
+    "Return HTML string for footnote reference.
+
+  If the post is in the index page, the reference will point to the
+  corresponding definition in the post page."
+    (let* ((id (org-element-property :label footnote-reference-element))
+           (def-id (format "#fn.%s" id))
+           (post (plist-get info :post-metadata))
+           (href (if (plist-get info :index-page-p)
+                     (format "%s%s" (jour-post-url post) def-id)
+                     def-id)))
+      (jour-dom-to-html
+       `(sup
+         ()
+         (a
+          ((id . ,(format "fnr.%s" id)) (href . ,href))
+          ,id)))))
+
+  (defun jour-html-headline (headline-element contents info)
+    (let* ((level (org-element-property :level headline-element))
+           (title (org-export-data (org-element-property :title headline-element) info))
+           (index-page-p (plist-get info :index-page-p))
+           (increase (if index-page-p 2 1)))
+      (format-spec "<h%d class=\"%a\">%t</h%d>\n%c"
+                   `((?t . ,title)
+                     (?c . ,contents)
+                     (?d . ,(+ level increase))
+                     (?a . ,(format "level-%d-heading" level))))))
+
+  ;; TODO Different <hr> styles?
+  (defun jour-html-hr (hr-element contents info)
+    "Return HTML string for hr element."
+    "<hr class=\"section-break\">")
+
+  (defun jour-html-italic (italic-element contents info)
+    (format "<em>%s</em>" contents))
+
+  (defun jour-html-item (item-element contents info)
+    (format "<li>%s</li>" (or contents "")))
+
+  (defun jour-html-line-break (br-element contents info)
+    "Return HTML string for line break element."
+    "<br>")
+
+  (defun image-p (ext)
+    "Check if the extension is an image format."
+    (member ext image-file-name-extensions))
+
+  (defun jour-html-link (link-element contents info)
+    "Return HTML string for link object.
+
+  If it's an image, return an <img> tag; plus if it's a local image
+  file, copy the file to the output directory. Otherwise return an
+  <a> tag."
+    (let* ((path (org-element-property :path link-element))
+           (link-type (org-element-property :type link-element))
+           (raw-link (org-element-property :raw-link link-element)))
+      (cond ((and (image-p (file-name-extension path)) (string= link-type "file"))
+             (let* ((post (plist-get info :post-metadata))
+                    (output-dir (jour-post-output-dir post))
+                    (post-url (jour-post-url post)))
+               (copy-file path output-dir t)
+               (format "<img src=\"%s\">" (jour-file-name-concat / post-url (file-name-nondirectory path)))))
+            ((and (image-p (file-name-extension path)) (not contents)) (format "<img src=\"%s\">" raw-link))
+            (t (format "<a href=\"%s\">%s</a>" raw-link (or contents raw-link))))))
+
+  (defun jour-html-paragraph (paragraph-element contents info)
+    (let ((lang (org-export-read-attribute :attr_html paragraph-element :lang)))
+      (if lang
+          (format "<p lang=\"%s\">%s</p>" lang contents)
+          (format "<p>%s</p>" contents))))
+
+  (defun jour-html-plain-list (plain-list-element contents info)
+    (let ((type (org-element-property :type plain-list-element)))
+      (format (if (eq type 'ordered) "<ol>%s</ol>" "<ul>%s</ul>")
+              contents)))
+
+  (defun jour-html-plain-text (text info)
+    "Remove \n character that's between two CJK characters in every
+  plain text string, and escape the string."
+    (cl-labels ((loop (curr accu)
+                  (cond ((eq curr nil) (or accu ""))
+                        ((jour-remove-space-p accu (car curr))
+                         (loop (cdr curr) (concat accu (car curr))))
+                        (t (loop (cdr curr) (concat accu " " (car curr)))))))
+
+      (let* ((segs (seq-filter (lambda (s) (not (string-empty-p s)))
+                               (string-split (org-html-encode-plain-text text) "\n"))))
+        (loop (cdr segs) (car segs)))))
+
+  (defun jour-html-quote-block (quote-element contents info)
+    (format "<blockquote>%s</blockquote>" contents))
+
+  (defun jour-html-section (section-element contents info)
+    "Skip creating <section> element."
+    contents)
+
+  (defun jour-src-block (src-block-element _contents info)
+    (format "<pre class=\"code\">%s</pre>"
+            (org-html-encode-plain-text (org-export-format-code-default src-block-element info))))
+
+  (defun jour-html-strike-through (strike-through-element contents info)
+    (format "<del>%s</del>" contents))
+
+  (defun jour-html-template (contents info)
+    "Render `CONTENTS' in post page layout.
+
+  This is the function which is called by org-export-* after
+  everything is transformed. When the argument `BODY-ONLY' of
+  org-export-* is true, this function is not called."
+    (let* ((post (plist-get info :post-metadata))
+           (date (jour-post-date-string post))
+           (updated (jour-post-updated post)))
+      (jour-render-post-page-layout
+       (jour-render-post contents post 'post info)
+       (if updated
+           (ignore-errors (format " Last update at %s." (format-time-string "%b %-d, %Y" updated))))
+       post)))
+#+end_src
+
+** Text processing
+
+This section deals with removing spaces around inline markups. It's
+pretty self contained. You can plug the function into Org's parse tree
+hook, and it would work in Org's own HTML export, I suppose.
+
+#+begin_src emacs-lisp
+  (defun jour-remove-space-p (a b)
+    "Return true if the last character of `A' or the first character of `B'
+  is a CJK character."
+    (and
+     (stringp a)
+     (stringp b)
+     (not (string-empty-p a))
+     (not (string-empty-p b))
+     (or
+      (jour-cjk-char-p (substring a -1))
+      (jour-cjk-char-p (substring b 0 1)))))
+
+  ;; TODO There're special cases like the link object where it's
+  ;; possible to not have children in which case the text should be the
+  ;; raw link value.
+  (defun jour-get-object-text (object &optional first-or-last)
+    "Return the text of an Org object or nil if not found. `OBJECT' 'roughly
+  correspond to raw, possibly-formatted text.' See
+  `org-element-all-objects'. `FIRST-OR-LAST' is either 'first or 'last,
+  specifying which chunk of the text in a recursive object should be
+  retrieved."
+    (let ((object-type (org-element-type object)))
+      (cond
+       ((eq object-type 'plain-text) object)
+       ((memq object-type '(code verbatim)) (org-element-property :value object))
+       ((memq object-type org-element-recursive-objects)
+        (let* ((contents (org-element-contents object))
+               (maybe-text (if (eq first-or-last 'last) (car (last contents)) (car contents))))
+          (if (eq (org-element-type maybe-text) 'plain-text)
+              maybe-text
+            (jour-get-object-text maybe-text first-or-last))))
+       ;; TODO footnote-reference is actually a recursive object. This branch is unreachable.
+       ((memq object-type '(footnote-reference)) (org-element-property :label object)))))
+
+  (defun jour-clean-spaces-around-inline-markup (ast backend info)
+    "Remove the spaces between the texts and the inline markup object,
+  if one of the characters around the space is a CJK character. The
+  preceding space is at the end of the previous text; the following
+  space is not in the text string but indicated by the :post-blank
+  property of the inline markup object."
+    (cl-labels ((clean-pre-space (text object)
+                  (let* ((ends-with-space-p (string= (substring text -1) " "))
+                         (last-char (if ends-with-space-p (substring text -2 -1) (substring text -1))))
+                    (cond ((not ends-with-space-p) nil)
+                          ((jour-remove-space-p last-char (jour-get-object-text object 'first))
+                           (org-element-set-element text (substring text 0 -1))))))
+
+                (clean-post-space (object text-or-object)
+                  (cond ((= (org-element-property :post-blank object) 0) nil)
+                        ((jour-remove-space-p (jour-get-object-text object 'last)
+                                              (jour-get-object-text text-or-object 'first))
+                         (org-element-put-property object :post-blank 0))))
+
+                (helper (contents)
+                  (cond ((or (null contents) (null (cdr contents))) '())
+                        ((and (eq (org-element-type (car contents)) 'plain-text)
+                              (memq (org-element-type (cadr contents)) org-element-all-objects))
+                         (progn
+                           (clean-pre-space (car contents) (cadr contents))
+                           (helper (cdr contents))))
+                        ((memq (org-element-type (car contents)) org-element-all-objects)
+                         (progn
+                           (clean-post-space (car contents) (cadr contents))
+                           (helper (cdr contents))))
+                        (t (helper (cdr contents))))))
+
+      (org-element-map ast '(paragraph)
+        (lambda (parent)
+          (let ((contents (org-element-contents parent)))
+            (helper contents))))
+
+      ast))
+
+  (when (not (member #'jour-clean-spaces-around-inline-markup org-export-filter-parse-tree-functions))
+    (add-hook 'org-export-filter-parse-tree-functions #'jour-clean-spaces-around-inline-markup))
+
+  (defvar jour-cjk-char-pat
+    (rx (in "\u4E00-\u9FFF"         ; Unified Ideographs
+            "\u3400-\u4DBF"         ; Unified Ideographs Extension A
+            "\uF900-\uFAFF"         ; Compatibility Ideographs
+            "\u3040-\u309F"         ; Hiragana
+            "\u30A0-\u30FF"         ; Katakana
+            "\u31F0-\u31FF"         ; Katakana Phonetic Extensions
+            "\uAC00-\uD7AF"         ; Hangul
+            "\u3000-\u303F"         ; Punctuation
+            "\uFF00-\uFFEF")))      ; Halfwidth and Fullwidth Forms
+
+  (defun jour-cjk-char-p (string)
+    "Check if `STRING' contains any CJK character."
+    (string-match-p jour-cjk-char-pat string))
+#+end_src
+
+** Layout
+
+#+begin_src emacs-lisp
+  (defun jour-dom-site-nav (&optional active-nav)
+    "Return a DOM tree for site navigation. `ACTIVE-NAV' is a string
+  or nil."
+    `(nav
+      ((aria-label . "Site"))
+      ,@(mapcar
+         (lambda (i)
+           `(a
+             ((href . ,(format "/%s/" i))
+              ,@(if (string= i active-nav) '((aria-current . "page"))))
+             ,(capitalize i)))
+         '("quotes" "hypertexts" "archive" "about"))))
+
+  (defun jour-render-base-layout (title title-element active-nav body extra-footer)
+    (jour-dom-to-html
+     `(html
+       ((lang . "zh"))
+       (head
+        ()
+        (meta ((charset . "UTF-8")))
+        (meta ((name . "viewport") (content . "width=device-width, initial-scale=1")))
+        (link ((href . "/assets/style.css") (rel . "stylesheet")))
+        (link ((href . "/rss.xml")
+               (rel . "alternate")
+               (type . "application/rss+xml")
+               (title . "RSS")))
+        (title () ,title))
+       (body
+        ()
+        (header
+         ()
+         (,title-element () (a ((href . "/")) "时日"))
+         ,(jour-dom-site-nav active-nav))
+        (main () ,body)
+        (hr ((class . "page-break") (aria-hidden . "true")))
+        (footer
+         ()
+         ,(if extra-footer
+              (format "Brought to you by Org mode. %s" extra-footer)
+            "Brought to you by Org mode."))))
+     t))
+
+  (defun jour-render-index-page-layout (contents &optional title active-nav)
+    (jour-render-base-layout (or title "时日") "h1" active-nav contents nil))
+
+  (defun jour-render-post-page-layout (contents footer post)
+    (jour-render-base-layout (jour-get-post-title post) "div" nil contents footer))
+
+  (defun jour-dom-post-nav (prev-post next-post)
+    "Return a DOM tree for post navigation. `PREV-POST' and
+  `NEXT-POST' are the alist returned by `jour-post-nav-data'."
+    `(nav
+      ((aria-label . "Post"))
+      ,(if prev-post
+           `(a
+             ((rel . "prev") (href . ,(alist-get 'url prev-post)))
+             ,(format "←%s" (alist-get 'title prev-post))))
+      ,(if next-post
+           `(a
+             ((rel . "next") (href . ,(alist-get 'url next-post)))
+             ,(format "%s→" (alist-get 'title next-post))))))
+
+  (defun jour-dom-post-footer (post)
+    "Return a DOM tree for post footer. `POST' is `jour-post'."
+    `(footer
+      ()
+      ,(jour-dom-post-nav (jour-post-prev-post post) (jour-post-next-post post))))
+
+  (defun jour-dom-footnote-definitions (info)
+    "Return a DOM tree for footnote definitions. `INFO' is the plist
+  passed around during Org export process, e.g. the second argument
+  to `jour-html-template', `EXT-PLIST' to org-export-*."
+    (let* ((definitions (org-export-collect-footnote-definitions info))
+           (footnotes-dom (mapcar
+                           (lambda (definition)
+                             (pcase definition
+                               (`(,_ ,label ,def)
+                                `(div
+                                  ((id . ,(format "fn.%s" label)))
+                                  (sup () (a ((href . ,(format "#fnr.%s" label))) ,label))
+                                  " "
+                                  ,(org-export-data def info)))))
+                           definitions)))
+      (if footnotes-dom
+          `(section ((id . "footnotes")) ,@footnotes-dom)
+        nil)))
+
+  (defun jour--render-post-helper (title heading-element heading-class
+                                         permalink date-iso8601 date
+                                         body footer &optional lang footnotes)
+    (jour-dom-to-html
+     `(article
+       ,(if lang `((lang . ,lang)) '())
+       (header
+        ()
+        (,heading-element
+         ,(if heading-class `((class . ,heading-class)) '())
+         (a ((href . ,permalink)) ,title))
+        (time
+         ((datetime . ,date-iso8601))
+         (a
+          ((href . ,permalink))
+          ,date)))
+       ,body
+       ,@(if footnotes `((hr ((class . "section-break"))) ,footnotes))
+       ,footer)))
+
+  (defun jour-render-post (body post page-type &optional info)
+    "Render POST as HTML with BODY.
+
+  BODY is a valid HTML string. POST is `jour-post'. PAGE-TYPE is
+  either 'index or 'post.
+
+  When PAGE-TYPE is 'index, the title of the post will be rendered
+  in an <h2> tag, otherwise it is rendered in an <h1> tag. When
+  PAGE-TYPE is 'post, a footer containing nav links will be added.
+  If it's a micro post, the title will be visually hidden."
+    (let ((title (jour-get-post-title post))
+          (date-iso8601 (jour-iso8601-time-string (jour-post-date post)))
+          (date-string (jour-post-date-string post))
+          (heading (if (eq page-type 'index) "h2" "h1"))
+          (href (jour-post-url post))
+          (lang (jour-post-lang post))
+          (footer (if (eq page-type 'post) (jour-dom-post-footer post) nil))
+          (footnotes (if (eq page-type 'post) (jour-dom-footnote-definitions info) nil)))
+      (if (jour-post-microp post)
+          (jour--render-post-helper title heading "visually-hidden"
+                                    href date-iso8601 date-string body
+                                    footer lang footnotes)
+        (jour--render-post-helper title heading nil
+                                  href date-iso8601 date-string body
+                                  footer lang footnotes))))
+
+  (defun jour-render-article-break ()
+    (jour-dom-to-html
+     `(div
+       ((class . "article-break")
+        (aria-hidden . "true"))
+       (div () "❦")
+       (div () "❦")
+       (div () "❦"))))
+#+end_src
+
+* Post data structure
+
+There are several struct fields which are dependent on other
+fields. Normally it's not a good idea to store derived values, since
+it can easily get out of sync. That is not an issue here because a
+post is never modified except for ~prev-post~ and ~next-post~.
+
+~keywords~ here usually means raw keywords collected from an Org file,
+which are parsed and validated into a plist, which is fed into the
+constructor.
+
+
+#+begin_src emacs-lisp
+  (cl-defstruct (jour-post (:constructor jour-post--create) (:copier nil))
+    (filename nil :documentation "Path of the current post in the filesystem.")
+    (date nil :documentation "Elisp time, e.g. time returned by `encode-time'.")
+    (slug nil :documentation "Pulled from the source file.")
+    (title nil :documentation "Title of the post, nil if it's a micro post.")
+    (updated nil :documentation "Update time. Pulled from the source file. Elisp time.")
+    (prev-post nil :documentation "Previous post. See `jour-post-nav-data'.")
+    (next-post nil :documentation "Next post. See `jour-post-nav-data'.")
+    (lang nil :documentation "Language of the post. It will be set on the lang attr on the article element.")
+    (publicp nil :documentation "Determine whether a post gets published. Pulled from the source file.")
+
+    (url nil :documentation "Absolute URL for the post, e.g. /2026/02/hi/")
+    (output-dir nil :documentation "Relative directory of the output HTML, e.g. build/2026/02/hi/")
+    (output-html nil :documentation "Relative filename of the output HTML, e.g. build/2026/02/hi/index.html")
+    (microp nil :documentation "Is it a micro post?")
+    (date-string nil :documentation "Formatted time string, e.g. 2026.02.02"))
+
+  (defun jour-post-collect-keywords (filename)
+    "Collect keywords from an Org file, and add filename as a keyword. Return
+  an alist with symbol keys. Repeated keywords are ignored."
+    (let* ((keywords '("title" "date" "slug" "updated" "public" "lang"))
+           (unique keywords))
+      (with-temp-buffer
+        (insert-file-contents filename)
+        ;; This might slow things down.
+        (org-mode)
+        (append
+         (list (cons 'filename filename))
+         (mapcar (lambda (x) (pcase x (`(,k . ,v) (cons (intern (downcase k)) v))))
+                 (org-collect-keywords keywords unique))))))
+
+  (defun jour-post-parse-public (val)
+    (pcase val ((or "t" "true") t) (_ nil)))
+
+  (defun jour-post-parse-time (time)
+    (if (stringp time)
+        (condition-case
+            nil
+            (encode-time (parse-time-string time))
+          (wrong-type-argument (user-error "time `%s' is malformatted" time)))
+      (user-error "time `%s' is not a string" time)))
+
+  (defun jour-post-parse-keyword (keyword)
+    (pcase keyword
+      (`(title . ,v) `(:title ,v))
+      (`(date . ,v) `(:date ,(jour-post-parse-time v)))
+      (`(slug . ,v) `(:slug ,v))
+      (`(updated . ,v) `(:updated ,(jour-post-parse-time v)))
+      (`(public . ,v) `(:publicp ,(jour-post-parse-public v)))
+      (`(lang . ,v) `(:lang ,v))
+      (`(filename . ,v) `(:filename ,v))))
+
+  (defun jour-post-parse-keywords (keywords)
+    (mapcan #'jour-post-parse-keyword keywords))
+
+  (defun jour-post-check-required-keywords (keywords)
+    (dolist (k '(date slug filename))
+      (unless (alist-get k keywords)
+        (user-error "field `%s' is missing" k))))
+
+  (defun jour-post-build-url (date slug microp)
+    (jour-file-name-concat
+     / (format-time-string (if microp "%Y/%m/%d" "%Y/%m") date) slug /))
+
+  ;; TODO Org time may not include hours, minutes, and seconds. Maybe
+  ;; support multiple time format?
+  (defun jour-post-create (keywords)
+    (condition-case
+        err
+        (progn
+          (jour-post-check-required-keywords keywords)
+          (let* ((metadata (jour-post-parse-keywords keywords))
+                 (microp (pcase (plist-get metadata :title)
+                           ((or (pred null) (and (pred stringp) (pred string-empty-p))) t)))
+                 (url (jour-post-build-url (plist-get metadata :date) (plist-get metadata :slug) microp))
+                 (date-string (format-time-string "%Y.%m.%d" (plist-get metadata :date)))
+                 (output-dir (jour-file-name-concat jour-output-directory url /))
+                 (output-html (jour-file-name-concat output-dir "index.html")))
+            (apply #'jour-post--create
+                   (append (list :microp microp
+                                 :url url
+                                 :date-string date-string
+                                 :output-dir output-dir
+                                 :output-html output-html)
+                           metadata))))
+      (error
+       (user-error "%s: %s"
+                   (file-name-nondirectory (alist-get 'filename keywords))
+                   (error-message-string err)))))
+
+  (defun jour-get-post-title (post)
+    (if (jour-post-microp post)
+        (format "Posted on %s" (jour-post-date-string post))
+      (jour-post-title post)))
+
+  (defun jour-post-nav-data (post)
+    "Extract url and title for inter post navigation use. Return an
+  alist with symbol keys."
+    (list (cons 'url (jour-post-url post))
+          (cons 'title (jour-get-post-title post))))
+#+end_src
+
+* HTML template engine
+
+Emacs has a function called ~shr-dom-to-xml~, but unfortunately it
+emits XML, adding a closing tag to every tag including void elements
+like ~meta~ and ~hr~. My version basically copies it, with some minor
+changes.
+
+#+begin_src emacs-lisp
+  (defconst jour-html-void-elements
+    '(area base br col embed hr img input link meta param source track wbr))
+
+  (defun jour-dom-print (dom)
+    (when (not (null (dom-tag dom)))
+      (insert (format "<%s" (dom-tag dom)))
+      (dolist (attr (dom-attributes dom))
+        (insert (format " %s=\"%s\"" (car attr) (cdr attr))))
+      (insert ">")
+      (cond
+       ((memq (dom-tag dom) jour-html-void-elements))
+       (t
+        (dolist (elem (dom-children dom))
+          (cond
+           ((stringp elem) (insert elem))
+           (t (jour-dom-print elem))))
+        (insert (format "</%s>" (dom-tag dom)))))))
+
+  (defun jour-dom-to-html (dom &optional doctype)
+    (with-temp-buffer
+      (when doctype
+        (insert "<!doctype html>\n"))
+      (jour-dom-print dom)
+      (buffer-string)))
+#+end_src
+
+* Build process
+
+#+begin_src emacs-lisp :var current-file=(buffer-file-name)
+  (defvar jour-output-directory "build")
+  (defvar jour-posts-directory "posts")
+  (defvar jour-meta-directory "posts/meta")
+
+  (defun jour-build-post-page (post)
+    (letrec ((filename (jour-post-filename post))
+             (output-dir (jour-post-output-dir post)))
+      (make-directory output-dir t)
+      (with-temp-buffer
+        (insert-file-contents filename)
+        (org-export-to-file
+            'jour-html (jour-post-output-html post) nil nil nil nil (list :post-metadata post)))))
+
+  (defun jour--org-export-body (&optional plist)
+    "Export current Org buffer into HTML without calling
+  `jour-html-template'."
+    (org-export-as 'jour-html nil nil t plist))
+
+  (defun jour-export-post-body (post &optional index-page-p)
+    "Export the body portion of `POST' to HTML by directly calling
+  `org-export-as' without stitching the HTML into base or article layout."
+    (with-temp-buffer
+      (insert-file-contents (jour-post-filename post))
+      (jour--org-export-body (list :post-metadata post :index-page-p index-page-p))))
+
+  (defun jour-export-post-full (post)
+    "Export `POST' to HTML as if it is in the index page."
+    (jour-render-post (jour-export-post-body post t) post 'index))
+
+  (defun jour-build-main-index (posts prev-post)
+    (let ((content (string-join (mapcar #'jour-export-post-full posts) (jour-render-article-break)))
+          (post-nav (if prev-post
+                        (jour-dom-to-html (jour-dom-post-nav (jour-post-nav-data prev-post)
+                                                             nil))
+                      "")))
+      (with-temp-file (jour-file-name-concat jour-output-directory "index.html")
+        (insert (jour-render-index-page-layout (concat content post-nav))))))
+
+  (defun jour-build-meta-page (name)
+    "Build meta page `NAME' by converting the Org file into its own
+  directory."
+    (let ((directory (jour-file-name-concat jour-output-directory name /)))
+      (make-directory directory)
+      (with-temp-file (jour-file-name-concat directory "index.html")
+        (insert (jour-render-index-page-layout
+                 (with-temp-buffer
+                   (insert-file-contents
+                    (jour-file-name-concat jour-meta-directory (format "%s.org" name)))
+                   (jour--org-export-body))
+                 (capitalize name)
+                 name)))))
+
+  (defun jour-build-quotes-page ()
+    (jour-build-meta-page "quotes"))
+
+  (defun jour-build-hypertexts-page ()
+    (jour-build-meta-page "hypertexts"))
+
+  (defun jour-build-about-page ()
+    (jour-build-meta-page "about"))
+
+  (defun jour-render-archive-list (posts)
+    (jour-dom-to-html
+     `(ul
+       ((id . "archive"))
+       ,@(mapcar (lambda (p)
+                   `(li
+                     ()
+                     (time
+                      ((datetime . ,(jour-iso8601-time-string (jour-post-date p))))
+                      ,(jour-post-date-string p))
+                     (a
+                      ((href . ,(jour-post-url p)))
+                      ,(jour-post-title p))))
+                 posts))))
+
+  (defun jour-build-archive-page (posts)
+    (let ((archive-directory (jour-file-name-concat jour-output-directory "archive" /)))
+      (make-directory archive-directory)
+      (with-temp-file (jour-file-name-concat archive-directory "index.html")
+        (insert (jour-render-index-page-layout
+                 (concat
+                  (jour-dom-to-html
+                   '(p
+                     ((class . "text-center"))
+                     (a
+                      ((href . "/archive/micro/") (class . "color-initial"))
+                      "\\(๑˃ᵐⁱᶜʳᵒ ᵖᵒˢᵗ ᵃʳᶜʰⁱᵛᵉ˂๑)/")))
+                  (jour-render-archive-list posts))
+                 "Archive"
+                 "archive")))))
+
+  (defun jour-build-micro-post-archive-page (posts)
+    (let ((archive-directory (jour-file-name-concat jour-output-directory "archive" "micro" /))
+          (content (string-join (mapcar #'jour-export-post-full posts) (jour-render-article-break))))
+      (make-directory archive-directory)
+      (with-temp-file (jour-file-name-concat archive-directory "index.html")
+        (insert (jour-render-index-page-layout
+                 content
+                 "Micro Post Archive"
+                 "archive")))))
+
+  (defun jour-format-rss-time (time)
+    (format-time-string "%a, %d %b %Y %H:%M:%S %z" time))
+
+  (defun jour-dom-rss-item (post)
+    `(item
+      ()
+      ,@(if (jour-post-microp post) nil `((title () ,(jour-post-title post))))
+      (description () ,(org-html-encode-plain-text (jour-export-post-body post)))
+      (guid () ,(concat "https://jour.kitschy.moe" (jour-post-url post)))
+      (pubDate () ,(jour-format-rss-time (jour-post-date post)))))
+
+  (defun jour-build-rss (posts)
+    (with-temp-file (jour-file-name-concat jour-output-directory "rss.xml")
+      (insert
+       (shr-dom-to-xml
+        `(rss
+          ((version . "2.0"))
+          (channel
+           ()
+           (title () "时日")
+           (link () "https://jour.kitschy.moe")
+           (description () "Pore over the excruciating minutiae of everyday life. after Elaine Benes")
+           (language () "zh")
+           ,@(mapcar #'jour-dom-rss-item posts)))))))
+
+  (defun jour-get-posts ()
+    "Return public posts in descending date order."
+    (let* ((filenames (directory-files jour-posts-directory t "^[^#\\.].+\\.org$"))
+           (entries (mapcar #'jour-post-collect-keywords filenames))
+           (public-entries (seq-filter (lambda (entry) (jour-post-parse-public (alist-get 'public entry))) entries))
+           (posts (mapcar #'jour-post-create public-entries)))
+      (sort posts (lambda (a b) (time-less-p (jour-post-date b) (jour-post-date a))))))
+
+  (defun jour-posts-add-neighbors (sorted-posts)
+    "Add previous and next post data in-place. Elisp seems to be very
+  permissive in this regard that car/cdr like operations on an
+  empty list all return nil."
+    (cl-labels ((helper (current rest prev-post next-post)
+                  (cond ((eq current nil) nil)
+                        (t (ignore-error wrong-type-argument
+                             (setf (jour-post-prev-post current) (jour-post-nav-data prev-post)))
+                           (ignore-error wrong-type-argument
+                             (setf (jour-post-next-post current) (jour-post-nav-data next-post)))
+                           (helper (car rest) (cdr rest) (cadr rest) current)))))
+
+      (helper (car sorted-posts) (cdr sorted-posts) (cadr sorted-posts) '())))
+
+  (defun jour-build-output-directory ()
+    "Create the directory for output files. Tangle assets source
+  blocks, e.g. CSS and images, into files."
+    (when (file-directory-p jour-output-directory)
+      (move-file-to-trash jour-output-directory))
+    (let ((assets-directory (jour-file-name-concat jour-output-directory "assets" /)))
+      (make-directory assets-directory t)
+      (org-babel-tangle-file current-file)))
+
+  (defun jour-build ()
+    (interactive)
+    (with-temp-buffer
+      (setq default-directory (file-name-directory current-file))
+      (let ((posts (jour-get-posts)))
+        (jour-build-output-directory)
+        (jour-posts-add-neighbors posts)
+        (mapc 'jour-build-post-page posts)
+        (jour-build-main-index (take 10 posts) (nth 10 posts))
+        (jour-build-rss (take 10 posts))
+        (jour-build-quotes-page)
+        (jour-build-hypertexts-page)
+        (jour-build-archive-page (seq-filter (lambda (p) (not (jour-post-microp p))) posts))
+        (jour-build-micro-post-archive-page (seq-filter (lambda (p) (jour-post-microp p)) posts))
+        (jour-build-about-page))))
+#+end_src
+
+* Helpers and keybindings
+
+#+begin_src emacs-lisp :var current-file=(buffer-file-name)
+  (defun jour-iso8601-time-string (&optional time)
+    (format-time-string "%FT%T" (or time (current-time))))
+
+  (defun jour--file-name-concat-helper (rootp dirp &rest names)
+    (cl-flet ((helper (names0)
+                (string-join (mapcan (lambda (s) (string-split s "/" t)) names0) "/")))
+      (concat (if rootp "/" "")
+              (helper names)
+              (if dirp "/" ""))))
+
+  (defmacro jour-file-name-concat (&rest names)
+    "Join file names, removing unnecessary slashes, adding leading or
+  ending slash."
+    (let ((rootp (eq (car names) '/))
+          (dirp (eq (car (last names)) '/))
+          (names0 (remq '/ names)))
+      `(jour--file-name-concat-helper ,rootp ,dirp ,@names0)))
+
+  (defun jour-write-micro-post ()
+    (interactive)
+    (let* ((current-directory (file-name-directory current-file))
+           (datetime (current-time))
+           (datetime-iso8601 (jour-iso8601-time-string datetime))
+           (slug (format-time-string "%H%M" datetime)))
+      (switch-to-buffer (make-temp-name "micro-post"))
+      (org-mode)
+      (insert (format "#+date: %s\n" datetime-iso8601))
+      (insert (format "#+slug: %s\n" slug))
+      (insert (format "#+public: false\n"))))
+
+  (defun jour-write-post (title)
+    (interactive "sTitle: ")
+    (let* ((current-directory (file-name-directory current-file))
+           (datetime-iso8601 (jour-iso8601-time-string (current-time))))
+      (switch-to-buffer (make-temp-name "post"))
+      (org-mode)
+      (insert (format "#+title: %s\n" title))
+      (insert (format "#+date: %s\n" datetime-iso8601))
+      (insert "#+slug: \n")
+      (insert (format "#+public: false\n"))))
+
+  (defun jour-deploy ()
+    (interactive)
+    (org-babel-ref-resolve "deploy"))
+
+
+  (defvar jour-map (define-keymap
+                     "m" #'jour-write-micro-post
+                     "j" #'jour-write-post
+                     "b" #'jour-build
+                     "d" #'jour-deploy))
+
+  (global-set-key (kbd "C-x j") jour-map)
+#+end_src
+
+* Deployment
+
+#+name: deploy
+#+begin_src sh
+  rsync -avz --delete build/ linode:/var/www/jour/
+  echo "Deploy successfully!"
+#+end_src
+
+* CSS
+
+#+begin_src css :tangle ./build/assets/style.css
+  :root {
+    --paragraph-spacing: 1.2em;
+  }
+
+  ,* {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    box-sizing: border-box;
+  }
+
+  html {
+    font-size: 18px;
+  }
+
+  html, body {
+    min-height: 100vh;
+  }
+
+  body {
+    font-family: ui-serif, Charter, 'Source Han Serif SC VF', serif;
+    width: 85vw;
+    max-width: 33em;
+    margin: 0 auto;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: ui-sans-serif, sans-serif;
+    font-size: inherit;
+  }
+
+  main {
+    display: flex;
+    flex-direction: column;
+    margin-top: 4px;
+    flex: 1;
+    gap: var(--paragraph-spacing);
+  }
+
+  a {
+    text-decoration: none;
+    color: inherit;
+  }
+
+  p a {
+    color: #B85C5C;
+  }
+
+  p:lang(zh) {
+    text-autospace: normal;
+  }
+
+  ul, ol {
+    list-style: none;
+  }
+
+  ul p, ol p {
+    margin: 0.5em auto;
+  }
+
+  img {
+    display: block;
+    max-width: 100%;
+    margin: 0 auto;
+    object-fit: contain;
+  }
+
+  blockquote {
+    margin-left: 3em;
+  }
+
+  body > header {
+    border-bottom: 4px black solid;
+    text-align: right;
+    padding: 4px 0;
+
+    & > div {
+      font-family: sans-serif;
+      font-weight: bold;
+    }
+  }
+
+  nav[aria-label="Site"] {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.25em;
+
+    & a[aria-current="page"]::after {
+      content: "°" / "";
+      font-weight: bold;
+    }
+  }
+
+  article {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    gap: var(--paragraph-spacing);
+
+    header {
+      margin-bottom: calc(2em - var(--paragraph-spacing));
+
+      h1, h2 {
+        font-size: 1.111em;
+      }
+    }
+
+    footer {
+      margin-top: auto;
+    }
+
+    ol, ul {
+      list-style-type: revert;
+      padding-left: 3em;
+    }
+  }
+
+  nav[aria-label="Post"] {
+    display: flex;
+    flex-wrap: wrap;
+    padding-top: 4em;
+    gap: 1em;
+
+    & a[rel="next"] {
+      margin-left: auto;
+    }
+  }
+
+  .section-break {
+    border-top: 4px double black;
+    position: relative;
+    overflow: visible;
+    margin: 2.5em auto;
+    width: 30%;
+  }
+
+  .section-break::after {
+    color: black;
+    content: "§" / "";
+    position: absolute;
+    background-color: white;
+    left: 50%;
+    transform: translate(-50%, calc(-50% - 4px));
+    padding: 4px;
+  }
+
+  .article-break {
+    display: flex;
+    justify-content: center;
+    gap: 1em;
+    margin: calc(2.5em - var(--paragraph-spacing));
+    font-size: 1.5em;
+
+    & div:nth-of-type(odd) {
+      transform: rotate(180deg);
+    }
+  }
+
+  .page-break {
+    background-repeat: no-repeat;
+    background-size: contain;
+    background-position: center;
+    background-image: url('/assets/Dotted_crotchet_rest.svg');
+    height: 21px;
+    margin: 4em 0;
+  }
+
+  body > footer {
+    font-style: italic;
+    padding-bottom: 1em;
+    text-align: center;
+  }
+
+  .code {
+    background-color: #F7F4F2;
+    padding: 1em;
+    border-radius: 1em;
+    overflow: auto;
+  }
+
+  .level-1-heading {
+    font-size: 1.055em;
+  }
+
+  .level-2-heading {
+    font-size: 1em;
+  }
+
+  .level-3-heading {
+    font-size: 0.944em;
+  }
+
+  #archive {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 1em;
+    row-gap: 0.5em;
+
+    li {
+      display: grid;
+      grid-column: 1 / span 2;
+      grid-template-columns: subgrid;
+      align-items: center;
+    }
+
+    time {
+      color: grey;
+      font-size: 90%;
+    }
+
+    li:nth-of-type(odd) time {
+      grid-column: 1;
+      text-align: right;
+    }
+
+    li:nth-of-type(odd) a {
+      grid-column: 2;
+    }
+
+    li:nth-of-type(even) time {
+      grid-column: 2;
+      grid-row: 1;
+    }
+
+    li:nth-of-type(even) a {
+      grid-column: 1;
+      grid-row: 1;
+      text-align: right;
+    }
+  }
+
+  .text-center {
+    text-align: center;
+  }
+
+  [id^="fn."] > p:nth-of-type(1) {
+    display: inline;
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border-width: 0;
+  }
+#+end_src
+
+* Assets
+
+A nice [[https://commons.wikimedia.org/wiki/File:Dotted_crotchet_rest.svg][rest symbol]] I found on the Wikimedia.
+
+#+begin_src xml :tangle ./build/assets/Dotted_crotchet_rest.svg
+  <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+  <!-- Created with Inkscape (http://www.inkscape.org/) -->
+  <svg xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:svg="http://www.w3.org/2000/svg" xmlns="http://www.w3.org/2000/svg" xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="48px" height="48px" id="svg3010" version="1.1" inkscape:version="0.48.4 r9939" sodipodi:docname="Dotted_crotchet_rest.svg">
+    <defs id="defs3012"/>
+    <sodipodi:namedview id="base" pagecolor="#ffffff" bordercolor="#666666" borderopacity="1.0" inkscape:pageopacity="0.0" inkscape:pageshadow="2" inkscape:zoom="3.5" inkscape:cx="24" inkscape:cy="24" inkscape:current-layer="layer1" showgrid="true" inkscape:grid-bbox="true" inkscape:document-units="px" inkscape:window-width="686" inkscape:window-height="671" inkscape:window-x="855" inkscape:window-y="311" inkscape:window-maximized="0" objecttolerance="1" gridtolerance="1" guidetolerance="1">
+      <inkscape:grid type="xygrid" id="grid2982" empspacing="5" visible="true" enabled="true" snapvisiblegridlinesonly="true"/>
+    </sodipodi:namedview>
+    <metadata id="metadata3015">
+      <rdf:RDF>
+        <cc:Work rdf:about="">
+          <dc:format>image/svg+xml</dc:format>
+          <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+          <dc:title/>
+        </cc:Work>
+      </rdf:RDF>
+    </metadata>
+    <g id="layer1" inkscape:label="Layer 1" inkscape:groupmode="layer">
+      <g transform="matrix(1.0404483,0,0,1.0404483,-0.11382068,0.3821897)" id="g3062">
+        <g id="layer1-3" transform="translate(0.58372879,-1006.634)">
+          <g id="text2883" style="font-size:40px;font-style:normal;font-weight:normal;fill:#000000;fill-opacity:1;stroke:none;font-family:Bitstream Vera Sans" transform="scale(-1,1)">
+            <path inkscape:connector-curvature="0" id="path2818" style="font-size:144px;font-variant:normal;font-stretch:normal;font-family:Musica;-inkscape-font-specification:Musica" d="m 0,1009.0468 -12.09375,43.3125 -4.640625,0 9.0703125,-32.5547 c -3.9843925,1.9688 -7.1718895,2.9531 -9.5624995,2.9532 -2.43751,-10e-5 -4.687508,-0.8672 -6.75,-2.6016 -2.015629,-1.7344 -3.02344,-3.8203 -3.023438,-6.2578 -2e-6,-2.0625 0.726559,-3.8203 2.179688,-5.2735 1.453118,-1.4531 3.210929,-2.1796 5.273437,-2.1796 2.062488,0 3.820299,0.7265 5.273437,2.1796 1.453109,1.4532 2.179671,3.211 2.179688,5.2735 -1.7e-5,1.2187 -0.281267,2.3672 -0.84375,3.4453 0.234358,0.1875 0.445296,0.2812 0.632812,0.2812 1.359357,0 3.1406053,-1.125 5.3437505,-3.375 1.7812258,-1.7812 3.1874744,-3.5156 4.21875,-5.2031 l 2.7421875,0"/>
+          </g>
+        </g>
+        <g transform="matrix(2.1779752,0,0,2.1779752,-963.2175,-76.743707)" id="g11065">
+          <path inkscape:connector-curvature="0" d="m 418,179.92468 a 2.25,2.3125 0 1 1 -4.5,0 2.25,2.3125 0 1 1 4.5,0 z" transform="matrix(-1,0,0,-1,876.8202,224.8988)" style="opacity:0.9;fill:#000000;fill-opacity:1;fill-rule:evenodd;stroke:none" id="path11060"/>
+        </g>
+      </g>
+    </g>
+  </svg>
+#+end_src
+
+A nice [[https://commons.wikimedia.org/wiki/File:Le_Cabinet_de_Lampsaque,_1784_-_vignette-59.png][fleuron]] I found on the Wikimedia. Using ChatGPT, I converted it
+to an SVG file, making its color a bit faded to look more like from a
+quaint book.
+
+#+begin_src xml :tangle ./build/assets/fleuron.svg
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 247 322" width="247" height="322" aria-hidden="true">
+    <defs>
+      <filter id="softWear" x="-4%" y="-4%" width="108%" height="108%">
+        <feGaussianBlur in="SourceAlpha" stdDeviation="0.18" result="blur"/>
+        <feColorMatrix in="blur" type="matrix"
+          values="1 0 0 0 0
+                  0 1 0 0 0
+                  0 0 1 0 0
+                  0 0 0 0.12 0" result="soft"/>
+        <feBlend in="SourceGraphic" in2="soft" mode="normal"/>
+      </filter>
+    </defs>
+    <g fill="#171412" fill-rule="evenodd">
+      <path d="M 123 275 L 121 275 L 118 277 L 118 279 L 117 280 L 117 286 L 115 288 L 115 290 L 113 292 L 110 292 L 107 288 L 103 288 L 98 293 L 98 296 L 104 296 L 105 297 L 103 299 L 102 299 L 101 301 L 101 303 L 103 305 L 105 306 L 107 306 L 109 305 L 115 298 L 115 294 L 118 291 L 120 292 L 120 297 L 117 302 L 117 306 L 113 310 L 113 316 L 116 316 L 117 317 L 117 320 L 118 321 L 124 321 L 131 313 L 129 307 L 126 304 L 125 302 L 125 297 L 126 296 L 130 300 L 132 304 L 137 304 L 141 300 L 141 298 L 139 297 L 138 295 L 140 293 L 145 293 L 145 290 L 140 287 L 136 287 L 136 288 L 133 290 L 130 290 L 128 288 L 126 288 L 127 290 L 127 294 L 125 296 L 123 292 L 123 288 L 125 286 L 125 278 Z M 124 309 L 125 308 L 127 309 L 128 311 L 127 312 L 125 312 L 124 311 Z M 120 257 L 118 258 L 118 260 L 117 261 L 117 264 L 118 264 L 120 261 Z M 171 205 L 170 206 L 170 210 L 166 214 L 164 220 L 159 223 L 159 225 L 160 226 L 159 228 L 157 226 L 155 226 L 154 227 L 148 227 L 142 230 L 140 230 L 139 231 L 140 236 L 139 237 L 133 237 L 126 244 L 124 248 L 124 254 L 123 255 L 123 259 L 124 261 L 126 261 L 127 260 L 127 250 L 128 249 L 128 247 L 129 245 L 133 241 L 135 240 L 137 240 L 138 241 L 138 243 L 133 248 L 133 249 L 130 253 L 130 258 L 131 260 L 135 265 L 136 265 L 140 268 L 148 268 L 151 266 L 152 264 L 151 259 L 148 256 L 142 256 L 140 258 L 138 258 L 137 257 L 137 250 L 140 247 L 141 247 L 144 243 L 146 243 L 148 242 L 153 237 L 154 235 L 156 234 L 158 234 L 160 232 L 161 229 L 166 223 L 167 221 L 167 219 L 170 216 L 170 208 L 171 207 Z M 79 200 L 80 205 L 82 209 L 84 211 L 84 212 L 87 215 L 87 216 L 88 216 L 93 220 L 95 220 L 98 223 L 102 223 L 104 225 L 106 225 L 107 224 L 112 224 L 116 222 L 116 220 L 117 219 L 117 216 L 116 215 L 114 215 L 111 213 L 109 213 L 108 214 L 104 214 L 103 215 L 100 215 L 99 214 L 95 214 L 91 211 L 89 211 L 87 210 L 84 207 L 84 205 L 83 203 L 80 200 Z M 86 197 L 88 200 L 88 202 L 89 204 L 94 208 L 96 208 L 97 209 L 106 209 L 107 208 L 107 206 L 100 206 L 99 205 L 95 205 L 89 199 L 88 197 Z M 160 196 L 158 195 L 148 204 L 146 205 L 139 205 L 138 207 L 139 208 L 146 208 L 150 205 L 151 205 L 154 202 L 155 202 L 160 197 Z M 24 179 L 19 184 L 17 188 L 17 191 L 21 194 L 22 194 L 24 192 L 26 192 L 28 196 L 31 196 L 34 192 L 34 187 L 32 185 L 32 181 L 33 179 L 31 178 L 29 178 L 28 179 Z M 26 181 L 27 180 L 28 182 L 27 183 Z M 76 176 L 70 182 L 70 183 L 68 185 L 67 187 L 67 190 L 65 194 L 65 207 L 67 211 L 67 219 L 68 219 L 71 222 L 76 232 L 82 237 L 83 237 L 89 243 L 91 244 L 96 244 L 95 242 L 94 242 L 91 239 L 90 239 L 83 232 L 84 230 L 86 231 L 89 234 L 93 236 L 97 240 L 99 240 L 102 242 L 104 242 L 107 245 L 107 246 L 109 248 L 109 255 L 107 257 L 104 257 L 103 256 L 103 252 L 100 253 L 94 259 L 94 263 L 95 265 L 99 270 L 101 270 L 104 267 L 108 267 L 113 264 L 113 249 L 112 248 L 112 245 L 113 244 L 115 245 L 118 248 L 118 247 L 117 246 L 117 244 L 116 242 L 113 239 L 111 238 L 107 238 L 105 236 L 105 232 L 103 230 L 101 230 L 96 227 L 91 227 L 89 226 L 76 212 L 75 212 L 74 215 L 76 217 L 78 221 L 78 223 L 77 224 L 74 221 L 73 219 L 73 217 L 72 216 L 72 213 L 70 209 L 70 202 L 69 201 L 69 198 L 70 197 L 70 191 L 72 187 L 74 185 L 78 185 L 79 187 L 83 190 L 84 190 L 87 186 L 87 180 L 84 177 L 82 177 L 81 176 Z M 78 226 L 80 225 L 81 227 L 80 228 Z M 166 173 L 162 173 L 160 174 L 157 177 L 157 180 L 156 181 L 156 187 L 157 188 L 160 188 L 162 186 L 165 186 L 167 189 L 167 195 L 164 199 L 164 200 L 161 203 L 161 204 L 156 209 L 152 211 L 150 211 L 149 212 L 136 212 L 131 209 L 127 209 L 125 213 L 125 217 L 131 221 L 133 221 L 134 222 L 137 222 L 138 221 L 144 221 L 146 219 L 147 219 L 149 217 L 150 217 L 152 215 L 156 213 L 160 209 L 161 209 L 163 205 L 166 202 L 166 200 L 167 199 L 167 194 L 168 193 L 168 187 L 167 186 L 167 183 L 168 182 L 170 183 L 175 188 L 175 190 L 178 194 L 178 206 L 177 207 L 177 212 L 172 218 L 172 222 L 168 226 L 167 229 L 164 232 L 162 236 L 160 238 L 159 238 L 154 243 L 153 243 L 152 245 L 156 245 L 159 242 L 161 242 L 165 238 L 165 237 L 167 235 L 168 235 L 170 230 L 174 225 L 176 221 L 176 219 L 178 217 L 178 215 L 180 211 L 181 202 L 182 201 L 182 194 L 181 193 L 181 190 L 180 189 L 180 187 L 178 185 L 178 183 L 171 175 L 169 174 L 167 174 Z M 178 168 L 178 173 L 179 175 L 182 177 L 185 177 L 186 178 L 188 178 L 192 174 L 192 172 L 187 172 L 186 171 L 185 171 L 185 173 L 183 174 L 179 170 Z M 49 172 L 46 168 L 44 169 L 35 169 L 35 171 L 36 172 L 36 177 L 38 176 L 41 176 L 42 177 L 44 177 L 46 176 L 49 173 Z M 69 165 L 64 165 L 62 166 L 62 167 L 65 168 L 67 170 L 67 171 L 64 173 L 59 173 L 57 177 L 57 180 L 61 180 L 65 177 L 66 177 L 68 175 L 68 172 L 70 170 L 70 166 Z M 0 174 L 3 177 L 5 178 L 6 181 L 9 184 L 9 188 L 11 188 L 11 185 L 15 181 L 15 179 L 17 177 L 19 177 L 21 175 L 31 175 L 33 173 L 33 172 L 27 172 L 26 171 L 24 171 L 19 168 L 16 168 L 14 167 L 10 163 L 8 163 L 7 165 L 7 168 L 6 169 L 3 169 L 1 171 Z M 11 177 L 12 176 L 14 176 L 16 178 L 15 179 L 12 179 Z M 179 153 L 180 154 L 180 156 L 182 158 L 184 159 L 186 159 L 187 158 L 187 156 L 183 156 Z M 27 149 L 26 150 L 27 152 L 27 155 L 25 156 L 24 154 L 22 152 L 21 152 L 19 154 L 18 154 L 17 156 L 17 160 L 19 164 L 21 165 L 23 165 L 24 166 L 27 166 L 31 168 L 31 166 L 29 164 L 29 160 L 33 157 L 33 153 L 30 149 Z M 246 153 L 245 152 L 243 152 L 241 154 L 239 154 L 238 153 L 241 150 L 240 147 L 236 147 L 234 149 L 232 149 L 231 150 L 226 151 L 224 153 L 223 153 L 220 156 L 220 158 L 221 160 L 224 160 L 229 163 L 231 163 L 233 165 L 237 165 L 239 162 L 241 162 L 245 159 L 246 157 Z M 191 144 L 187 144 L 186 145 L 184 145 L 182 146 L 180 148 L 180 151 L 183 148 L 185 148 L 189 146 Z M 56 142 L 52 146 L 52 156 L 53 158 L 55 159 L 61 159 L 56 155 L 56 152 L 57 151 L 61 151 L 61 149 L 62 148 L 64 148 L 66 151 L 66 155 L 68 155 L 68 146 L 66 143 L 64 143 L 63 142 Z M 219 132 L 216 132 L 211 137 L 211 140 L 214 144 L 214 147 L 213 148 L 209 150 L 203 150 L 201 149 L 199 151 L 199 156 L 200 158 L 202 159 L 206 159 L 207 160 L 210 160 L 213 162 L 214 164 L 214 169 L 212 172 L 212 174 L 215 180 L 217 180 L 218 179 L 218 177 L 217 176 L 218 174 L 222 174 L 223 175 L 225 175 L 227 174 L 228 172 L 228 169 L 227 167 L 221 162 L 218 162 L 213 157 L 214 156 L 216 157 L 215 155 L 215 151 L 216 150 L 223 150 L 225 149 L 227 146 L 227 143 L 229 142 L 229 138 L 226 136 L 224 136 L 221 139 L 219 139 L 218 138 L 218 136 L 219 135 Z M 106 113 L 105 112 L 101 112 L 95 115 L 95 116 L 92 119 L 91 119 L 87 123 L 87 124 L 89 124 L 90 122 L 95 117 L 97 116 L 99 116 L 100 115 L 105 115 Z M 141 112 L 141 114 L 142 115 L 149 115 L 151 116 L 153 118 L 157 120 L 160 123 L 161 125 L 161 123 L 159 121 L 159 119 L 158 117 L 155 114 L 153 114 L 150 112 L 147 112 L 146 111 L 142 111 Z M 122 104 L 118 100 L 116 99 L 106 99 L 103 101 L 99 101 L 93 107 L 90 108 L 88 110 L 88 111 L 83 115 L 79 123 L 79 126 L 83 118 L 86 115 L 86 114 L 92 109 L 94 108 L 102 108 L 103 107 L 110 107 L 112 108 L 115 111 L 116 111 L 117 110 L 122 110 Z M 130 100 L 130 102 L 133 103 L 135 107 L 139 107 L 140 106 L 153 106 L 156 109 L 157 109 L 164 116 L 165 118 L 165 120 L 167 122 L 167 123 L 168 124 L 170 124 L 170 119 L 166 114 L 165 112 L 165 110 L 160 105 L 159 105 L 157 103 L 153 101 L 150 98 L 148 97 L 145 97 L 144 98 L 132 98 Z M 96 73 L 89 76 L 86 79 L 85 79 L 78 86 L 74 94 L 71 97 L 69 102 L 67 104 L 66 106 L 66 108 L 64 111 L 64 116 L 62 118 L 62 122 L 63 123 L 63 126 L 64 127 L 65 134 L 67 136 L 70 142 L 73 143 L 78 147 L 84 147 L 86 146 L 89 143 L 91 139 L 90 134 L 87 131 L 84 131 L 83 134 L 81 135 L 78 131 L 78 134 L 79 135 L 79 137 L 78 138 L 76 138 L 72 134 L 71 132 L 71 129 L 69 125 L 69 119 L 67 118 L 67 116 L 70 112 L 70 109 L 71 108 L 71 106 L 73 104 L 76 97 L 78 95 L 81 89 L 95 75 Z M 128 58 L 127 59 L 127 65 L 128 66 Z M 138 55 L 135 58 L 133 72 L 132 73 L 129 73 L 129 75 L 134 80 L 138 82 L 140 82 L 142 84 L 142 89 L 143 90 L 145 90 L 154 95 L 156 95 L 160 97 L 170 107 L 170 109 L 172 111 L 174 110 L 176 110 L 177 111 L 177 129 L 174 135 L 171 138 L 170 138 L 169 137 L 169 135 L 165 132 L 163 132 L 161 134 L 161 140 L 162 142 L 166 145 L 171 145 L 176 141 L 176 140 L 179 137 L 180 134 L 182 132 L 182 127 L 183 126 L 183 121 L 182 120 L 182 111 L 181 110 L 181 107 L 179 104 L 179 102 L 174 92 L 165 82 L 162 81 L 159 78 L 157 77 L 154 77 L 155 82 L 154 83 L 152 83 L 148 79 L 148 78 L 146 77 L 143 77 L 140 74 L 138 73 L 138 68 L 140 65 L 142 65 L 143 66 L 143 68 L 145 69 L 149 66 L 150 66 L 156 61 L 156 60 L 151 55 L 149 54 L 145 54 L 142 56 L 140 56 Z M 172 100 L 173 100 L 175 103 L 175 108 L 174 109 L 172 107 L 172 102 L 171 101 Z M 134 76 L 135 75 L 137 76 L 136 77 Z M 110 52 L 106 52 L 102 55 L 97 56 L 92 60 L 94 64 L 96 65 L 98 65 L 99 66 L 102 66 L 104 65 L 105 63 L 108 63 L 109 64 L 109 68 L 106 72 L 106 73 L 103 76 L 100 77 L 92 85 L 91 85 L 86 90 L 85 92 L 84 92 L 84 93 L 81 96 L 79 101 L 77 103 L 77 107 L 76 108 L 76 111 L 79 108 L 81 104 L 88 97 L 88 96 L 89 95 L 91 95 L 94 91 L 99 92 L 101 90 L 106 90 L 107 88 L 104 84 L 107 82 L 111 82 L 116 79 L 118 79 L 121 76 L 121 73 L 123 69 L 123 64 L 121 62 L 120 62 L 119 71 L 118 72 L 118 74 L 117 76 L 113 80 L 111 81 L 109 80 L 109 76 L 111 74 L 111 73 L 114 71 L 115 69 L 115 66 L 116 65 L 116 59 L 115 57 L 113 56 Z M 102 82 L 103 84 L 102 86 L 100 87 L 99 86 L 99 84 L 101 82 Z M 128 0 L 124 0 L 123 2 L 121 4 L 119 4 L 117 7 L 117 11 L 122 16 L 123 18 L 123 22 L 125 26 L 125 29 L 123 30 L 121 28 L 119 23 L 117 21 L 117 19 L 115 17 L 108 17 L 106 20 L 106 24 L 102 27 L 102 29 L 108 34 L 111 34 L 114 30 L 117 30 L 121 34 L 121 45 L 123 47 L 126 47 L 129 44 L 129 42 L 130 41 L 130 37 L 134 30 L 138 30 L 143 33 L 146 33 L 151 28 L 151 26 L 147 23 L 147 19 L 146 17 L 143 15 L 141 15 L 140 16 L 138 16 L 135 19 L 135 20 L 132 24 L 132 27 L 131 29 L 129 31 L 127 30 L 127 27 L 128 26 L 128 21 L 131 18 L 131 13 L 134 10 L 135 10 L 135 7 L 132 7 L 130 5 L 130 2 Z" opacity="0.82" filter="url(#softWear)"/>
+      <path d="M 123 275 L 121 275 L 118 277 L 118 279 L 117 280 L 117 286 L 115 288 L 115 290 L 113 292 L 110 292 L 107 288 L 103 288 L 98 293 L 98 296 L 104 296 L 105 297 L 103 299 L 102 299 L 101 301 L 101 303 L 103 305 L 105 306 L 107 306 L 109 305 L 115 298 L 115 294 L 118 291 L 120 292 L 120 297 L 117 302 L 117 306 L 113 310 L 113 316 L 116 316 L 117 317 L 117 320 L 118 321 L 124 321 L 131 313 L 129 307 L 126 304 L 125 302 L 125 297 L 126 296 L 130 300 L 132 304 L 137 304 L 141 300 L 141 298 L 139 297 L 138 295 L 140 293 L 145 293 L 145 290 L 140 287 L 136 287 L 136 288 L 133 290 L 130 290 L 128 288 L 126 288 L 127 290 L 127 294 L 125 296 L 123 292 L 123 288 L 125 286 L 125 278 Z M 124 309 L 125 308 L 127 309 L 128 311 L 127 312 L 125 312 L 124 311 Z M 120 257 L 118 258 L 118 260 L 117 261 L 117 264 L 118 264 L 120 261 Z M 171 205 L 170 206 L 170 210 L 166 214 L 164 220 L 159 223 L 159 225 L 160 226 L 159 228 L 157 226 L 155 226 L 154 227 L 148 227 L 142 230 L 140 230 L 139 231 L 140 236 L 139 237 L 133 237 L 126 244 L 124 248 L 124 254 L 123 255 L 123 259 L 124 261 L 126 261 L 127 260 L 127 250 L 128 249 L 128 247 L 129 245 L 133 241 L 135 240 L 137 240 L 138 241 L 138 243 L 133 248 L 133 249 L 130 253 L 130 258 L 131 260 L 135 265 L 136 265 L 140 268 L 148 268 L 151 266 L 152 264 L 151 259 L 148 256 L 142 256 L 140 258 L 138 258 L 137 257 L 137 250 L 140 247 L 141 247 L 144 243 L 146 243 L 148 242 L 153 237 L 154 235 L 156 234 L 158 234 L 160 232 L 161 229 L 166 223 L 167 221 L 167 219 L 170 216 L 170 208 L 171 207 Z M 79 200 L 80 205 L 82 209 L 84 211 L 84 212 L 87 215 L 87 216 L 88 216 L 93 220 L 95 220 L 98 223 L 102 223 L 104 225 L 106 225 L 107 224 L 112 224 L 116 222 L 116 220 L 117 219 L 117 216 L 116 215 L 114 215 L 111 213 L 109 213 L 108 214 L 104 214 L 103 215 L 100 215 L 99 214 L 95 214 L 91 211 L 89 211 L 87 210 L 84 207 L 84 205 L 83 203 L 80 200 Z M 86 197 L 88 200 L 88 202 L 89 204 L 94 208 L 96 208 L 97 209 L 106 209 L 107 208 L 107 206 L 100 206 L 99 205 L 95 205 L 89 199 L 88 197 Z M 160 196 L 158 195 L 148 204 L 146 205 L 139 205 L 138 207 L 139 208 L 146 208 L 150 205 L 151 205 L 154 202 L 155 202 L 160 197 Z M 24 179 L 19 184 L 17 188 L 17 191 L 21 194 L 22 194 L 24 192 L 26 192 L 28 196 L 31 196 L 34 192 L 34 187 L 32 185 L 32 181 L 33 179 L 31 178 L 29 178 L 28 179 Z M 26 181 L 27 180 L 28 182 L 27 183 Z M 76 176 L 70 182 L 70 183 L 68 185 L 67 187 L 67 190 L 65 194 L 65 207 L 67 211 L 67 219 L 68 219 L 71 222 L 76 232 L 82 237 L 83 237 L 89 243 L 91 244 L 96 244 L 95 242 L 94 242 L 91 239 L 90 239 L 83 232 L 84 230 L 86 231 L 89 234 L 93 236 L 97 240 L 99 240 L 102 242 L 104 242 L 107 245 L 107 246 L 109 248 L 109 255 L 107 257 L 104 257 L 103 256 L 103 252 L 100 253 L 94 259 L 94 263 L 95 265 L 99 270 L 101 270 L 104 267 L 108 267 L 113 264 L 113 249 L 112 248 L 112 245 L 113 244 L 115 245 L 118 248 L 118 247 L 117 246 L 117 244 L 116 242 L 113 239 L 111 238 L 107 238 L 105 236 L 105 232 L 103 230 L 101 230 L 96 227 L 91 227 L 89 226 L 76 212 L 75 212 L 74 215 L 76 217 L 78 221 L 78 223 L 77 224 L 74 221 L 73 219 L 73 217 L 72 216 L 72 213 L 70 209 L 70 202 L 69 201 L 69 198 L 70 197 L 70 191 L 72 187 L 74 185 L 78 185 L 79 187 L 83 190 L 84 190 L 87 186 L 87 180 L 84 177 L 82 177 L 81 176 Z M 78 226 L 80 225 L 81 227 L 80 228 Z M 166 173 L 162 173 L 160 174 L 157 177 L 157 180 L 156 181 L 156 187 L 157 188 L 160 188 L 162 186 L 165 186 L 167 189 L 167 195 L 164 199 L 164 200 L 161 203 L 161 204 L 156 209 L 152 211 L 150 211 L 149 212 L 136 212 L 131 209 L 127 209 L 125 213 L 125 217 L 131 221 L 133 221 L 134 222 L 137 222 L 138 221 L 144 221 L 146 219 L 147 219 L 149 217 L 150 217 L 152 215 L 156 213 L 160 209 L 161 209 L 163 205 L 166 202 L 166 200 L 167 199 L 167 194 L 168 193 L 168 187 L 167 186 L 167 183 L 168 182 L 170 183 L 175 188 L 175 190 L 178 194 L 178 206 L 177 207 L 177 212 L 172 218 L 172 222 L 168 226 L 167 229 L 164 232 L 162 236 L 160 238 L 159 238 L 154 243 L 153 243 L 152 245 L 156 245 L 159 242 L 161 242 L 165 238 L 165 237 L 167 235 L 168 235 L 170 230 L 174 225 L 176 221 L 176 219 L 178 217 L 178 215 L 180 211 L 181 202 L 182 201 L 182 194 L 181 193 L 181 190 L 180 189 L 180 187 L 178 185 L 178 183 L 171 175 L 169 174 L 167 174 Z M 178 168 L 178 173 L 179 175 L 182 177 L 185 177 L 186 178 L 188 178 L 192 174 L 192 172 L 187 172 L 186 171 L 185 171 L 185 173 L 183 174 L 179 170 Z M 49 172 L 46 168 L 44 169 L 35 169 L 35 171 L 36 172 L 36 177 L 38 176 L 41 176 L 42 177 L 44 177 L 46 176 L 49 173 Z M 69 165 L 64 165 L 62 166 L 62 167 L 65 168 L 67 170 L 67 171 L 64 173 L 59 173 L 57 177 L 57 180 L 61 180 L 65 177 L 66 177 L 68 175 L 68 172 L 70 170 L 70 166 Z M 0 174 L 3 177 L 5 178 L 6 181 L 9 184 L 9 188 L 11 188 L 11 185 L 15 181 L 15 179 L 17 177 L 19 177 L 21 175 L 31 175 L 33 173 L 33 172 L 27 172 L 26 171 L 24 171 L 19 168 L 16 168 L 14 167 L 10 163 L 8 163 L 7 165 L 7 168 L 6 169 L 3 169 L 1 171 Z M 11 177 L 12 176 L 14 176 L 16 178 L 15 179 L 12 179 Z M 179 153 L 180 154 L 180 156 L 182 158 L 184 159 L 186 159 L 187 158 L 187 156 L 183 156 Z M 27 149 L 26 150 L 27 152 L 27 155 L 25 156 L 24 154 L 22 152 L 21 152 L 19 154 L 18 154 L 17 156 L 17 160 L 19 164 L 21 165 L 23 165 L 24 166 L 27 166 L 31 168 L 31 166 L 29 164 L 29 160 L 33 157 L 33 153 L 30 149 Z M 246 153 L 245 152 L 243 152 L 241 154 L 239 154 L 238 153 L 241 150 L 240 147 L 236 147 L 234 149 L 232 149 L 231 150 L 226 151 L 224 153 L 223 153 L 220 156 L 220 158 L 221 160 L 224 160 L 229 163 L 231 163 L 233 165 L 237 165 L 239 162 L 241 162 L 245 159 L 246 157 Z M 191 144 L 187 144 L 186 145 L 184 145 L 182 146 L 180 148 L 180 151 L 183 148 L 185 148 L 189 146 Z M 56 142 L 52 146 L 52 156 L 53 158 L 55 159 L 61 159 L 56 155 L 56 152 L 57 151 L 61 151 L 61 149 L 62 148 L 64 148 L 66 151 L 66 155 L 68 155 L 68 146 L 66 143 L 64 143 L 63 142 Z M 219 132 L 216 132 L 211 137 L 211 140 L 214 144 L 214 147 L 213 148 L 209 150 L 203 150 L 201 149 L 199 151 L 199 156 L 200 158 L 202 159 L 206 159 L 207 160 L 210 160 L 213 162 L 214 164 L 214 169 L 212 172 L 212 174 L 215 180 L 217 180 L 218 179 L 218 177 L 217 176 L 218 174 L 222 174 L 223 175 L 225 175 L 227 174 L 228 172 L 228 169 L 227 167 L 221 162 L 218 162 L 213 157 L 214 156 L 216 157 L 215 155 L 215 151 L 216 150 L 223 150 L 225 149 L 227 146 L 227 143 L 229 142 L 229 138 L 226 136 L 224 136 L 221 139 L 219 139 L 218 138 L 218 136 L 219 135 Z M 106 113 L 105 112 L 101 112 L 95 115 L 95 116 L 92 119 L 91 119 L 87 123 L 87 124 L 89 124 L 90 122 L 95 117 L 97 116 L 99 116 L 100 115 L 105 115 Z M 141 112 L 141 114 L 142 115 L 149 115 L 151 116 L 153 118 L 157 120 L 160 123 L 161 125 L 161 123 L 159 121 L 159 119 L 158 117 L 155 114 L 153 114 L 150 112 L 147 112 L 146 111 L 142 111 Z M 122 104 L 118 100 L 116 99 L 106 99 L 103 101 L 99 101 L 93 107 L 90 108 L 88 110 L 88 111 L 83 115 L 79 123 L 79 126 L 83 118 L 86 115 L 86 114 L 92 109 L 94 108 L 102 108 L 103 107 L 110 107 L 112 108 L 115 111 L 116 111 L 117 110 L 122 110 Z M 130 100 L 130 102 L 133 103 L 135 107 L 139 107 L 140 106 L 153 106 L 156 109 L 157 109 L 164 116 L 165 118 L 165 120 L 167 122 L 167 123 L 168 124 L 170 124 L 170 119 L 166 114 L 165 112 L 165 110 L 160 105 L 159 105 L 157 103 L 153 101 L 150 98 L 148 97 L 145 97 L 144 98 L 132 98 Z M 96 73 L 89 76 L 86 79 L 85 79 L 78 86 L 74 94 L 71 97 L 69 102 L 67 104 L 66 106 L 66 108 L 64 111 L 64 116 L 62 118 L 62 122 L 63 123 L 63 126 L 64 127 L 65 134 L 67 136 L 70 142 L 73 143 L 78 147 L 84 147 L 86 146 L 89 143 L 91 139 L 90 134 L 87 131 L 84 131 L 83 134 L 81 135 L 78 131 L 78 134 L 79 135 L 79 137 L 78 138 L 76 138 L 72 134 L 71 132 L 71 129 L 69 125 L 69 119 L 67 118 L 67 116 L 70 112 L 70 109 L 71 108 L 71 106 L 73 104 L 76 97 L 78 95 L 81 89 L 95 75 Z M 128 58 L 127 59 L 127 65 L 128 66 Z M 138 55 L 135 58 L 133 72 L 132 73 L 129 73 L 129 75 L 134 80 L 138 82 L 140 82 L 142 84 L 142 89 L 143 90 L 145 90 L 154 95 L 156 95 L 160 97 L 170 107 L 170 109 L 172 111 L 174 110 L 176 110 L 177 111 L 177 129 L 174 135 L 171 138 L 170 138 L 169 137 L 169 135 L 165 132 L 163 132 L 161 134 L 161 140 L 162 142 L 166 145 L 171 145 L 176 141 L 176 140 L 179 137 L 180 134 L 182 132 L 182 127 L 183 126 L 183 121 L 182 120 L 182 111 L 181 110 L 181 107 L 179 104 L 179 102 L 174 92 L 165 82 L 162 81 L 159 78 L 157 77 L 154 77 L 155 82 L 154 83 L 152 83 L 148 79 L 148 78 L 146 77 L 143 77 L 140 74 L 138 73 L 138 68 L 140 65 L 142 65 L 143 66 L 143 68 L 145 69 L 149 66 L 150 66 L 156 61 L 156 60 L 151 55 L 149 54 L 145 54 L 142 56 L 140 56 Z M 172 100 L 173 100 L 175 103 L 175 108 L 174 109 L 172 107 L 172 102 L 171 101 Z M 134 76 L 135 75 L 137 76 L 136 77 Z M 110 52 L 106 52 L 102 55 L 97 56 L 92 60 L 94 64 L 96 65 L 98 65 L 99 66 L 102 66 L 104 65 L 105 63 L 108 63 L 109 64 L 109 68 L 106 72 L 106 73 L 103 76 L 100 77 L 92 85 L 91 85 L 86 90 L 85 92 L 84 92 L 84 93 L 81 96 L 79 101 L 77 103 L 77 107 L 76 108 L 76 111 L 79 108 L 81 104 L 88 97 L 88 96 L 89 95 L 91 95 L 94 91 L 99 92 L 101 90 L 106 90 L 107 88 L 104 84 L 107 82 L 111 82 L 116 79 L 118 79 L 121 76 L 121 73 L 123 69 L 123 64 L 121 62 L 120 62 L 119 71 L 118 72 L 118 74 L 117 76 L 113 80 L 111 81 L 109 80 L 109 76 L 111 74 L 111 73 L 114 71 L 115 69 L 115 66 L 116 65 L 116 59 L 115 57 L 113 56 Z M 102 82 L 103 84 L 102 86 L 100 87 L 99 86 L 99 84 L 101 82 Z M 128 0 L 124 0 L 123 2 L 121 4 L 119 4 L 117 7 L 117 11 L 122 16 L 123 18 L 123 22 L 125 26 L 125 29 L 123 30 L 121 28 L 119 23 L 117 21 L 117 19 L 115 17 L 108 17 L 106 20 L 106 24 L 102 27 L 102 29 L 108 34 L 111 34 L 114 30 L 117 30 L 121 34 L 121 45 L 123 47 L 126 47 L 129 44 L 129 42 L 130 41 L 130 37 L 134 30 L 138 30 L 143 33 L 146 33 L 151 28 L 151 26 L 147 23 L 147 19 L 146 17 L 143 15 L 141 15 L 140 16 L 138 16 L 135 19 L 135 20 L 132 24 L 132 27 L 131 29 L 129 31 L 127 30 L 127 27 L 128 26 L 128 21 L 131 18 L 131 13 L 134 10 L 135 10 L 135 7 L 132 7 L 130 5 L 130 2 Z" opacity="0.18"/>
+    </g>
+  </svg>
+
+#+end_src
+
+* To do or not to do, that is the question
+
+- [ ] For now, I just ~org-babel-load-file~ this file in my init file.
+  This slows down the startup process. I need to tangle the main code
+  into a separate file and lazy load it.
+- [ ] Web font
+- [ ] ~img~ should have an alt attribute, and its filename should not
+  contain spaces.
+- [ ] Transient menu
+- [ ] Most markup languages only have one style for italics and one
+  style for bold. However, HTML actually has two elements for each
+  style, ~i~ and ~em~ for italics, ~b~ and ~strong~ for bold. They
+  have different semantics. Can I make Org to output them accordingly?
+- [ ] 标点挤压
