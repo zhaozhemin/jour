@@ -332,7 +332,7 @@ hook, and it would work in Org's own HTML export, I suppose.
         ()
         (meta ((charset . "UTF-8")))
         (meta ((name . "viewport") (content . "width=device-width, initial-scale=1")))
-        (link ((href . "/assets/style.css") (rel . "stylesheet")))
+        (link ((href . ,jour-css-url) (rel . "stylesheet")))
         (link ((href . "/rss.xml")
                (rel . "alternate")
                (type . "application/rss+xml")
@@ -606,10 +606,6 @@ changes.
 * Build process
 
 #+begin_src emacs-lisp :var current-file=(buffer-file-name)
-  (defvar jour-output-directory "build")
-  (defvar jour-posts-directory "posts")
-  (defvar jour-meta-directory "posts/meta")
-
   (defun jour-build-post-page (post)
     (letrec ((filename (jour-post-filename post))
              (output-dir (jour-post-output-dir post)))
@@ -760,9 +756,9 @@ changes.
   blocks, e.g. CSS and images, into files."
     (when (file-directory-p jour-output-directory)
       (move-file-to-trash jour-output-directory))
-    (let ((assets-directory (jour-file-name-concat jour-output-directory "assets" /)))
-      (make-directory assets-directory t)
-      (org-babel-tangle-file current-file)))
+    (make-directory jour-assets-directory t)
+    (org-babel-tangle-file current-file)
+    (jour-cache-busting-css))
 
   (defun jour-build ()
     (interactive)
@@ -781,9 +777,27 @@ changes.
         (jour-build-about-page))))
 #+end_src
 
-* Helpers and keybindings
+* Utilities and keybindings
 
-#+begin_src emacs-lisp :var current-file=(buffer-file-name)
+#+begin_src emacs-lisp :var current-file=(buffer-file-name) assets-directory-name=assets-directory-name
+  (defun jour-tangle-assets-filename (name &optional resolve-ref)
+    "Return an asset file path for NAME. If RESOLVE-REF is non-nil, resolve
+  NAME as an Org Babel reference and use its value as the filename."
+    (let ((filename (if resolve-ref (string-trim (org-babel-ref-resolve name)) name)))
+      (jour-file-name-concat jour-assets-directory filename)))
+
+  (defun jour-cache-busting-css ()
+    "Rename the tangled CSS file to include its content hash."
+    (let ((css-file (jour-file-name-concat jour-assets-directory jour-css-filename)))
+      (with-temp-buffer
+        (insert-file-contents css-file)
+        (let* ((hash (substring (secure-hash 'sha256 (current-buffer)) 0 8))
+               (new-filename (format "style.%s.css" hash))
+               (new-location (jour-file-name-concat jour-assets-directory new-filename)))
+          (setq jour-css-url (jour-file-name-concat / assets-directory-name new-filename))
+          (rename-file css-file new-location)
+          new-location))))
+
   (defun jour-iso8601-time-string (&optional time)
     (format-time-string "%FT%T" (or time (current-time))))
 
@@ -839,6 +853,26 @@ changes.
   (global-set-key (kbd "C-x j") jour-map)
 #+end_src
 
+* Config
+
+This section contains system-wide variables such as the build
+directory. The assets directory is also referenced in the CSS file, so
+I put it in a separate block here.
+
+#+name: assets-directory-name
+#+begin_src org
+  assets
+#+end_src
+
+#+begin_src emacs-lisp :noweb yes :noweb-prefix no
+  (setq jour-output-directory "build"
+        jour-assets-directory "build/<<assets-directory-name>>"
+        jour-posts-directory "posts"
+        jour-meta-directory "posts/meta"
+        jour-css-filename "style.css"
+        jour-css-url "/<<assets-directory-name>>/style.css")
+#+end_src
+
 * Deployment
 
 #+name: deploy
@@ -849,7 +883,7 @@ changes.
 
 * CSS
 
-#+begin_src css :tangle ./build/assets/style.css
+#+begin_src css :tangle (jour-tangle-assets-filename jour-css-filename) :noweb yes :noweb-prefix no
   :root {
     --paragraph-spacing: 1.2em;
   }
@@ -870,7 +904,7 @@ changes.
   }
 
   body {
-    font-family: ui-serif, Charter, 'Source Han Serif SC VF', serif;
+    font-family: ui-serif, Charter, "Source Han Serif SC VF", serif;
     width: 85vw;
     max-width: 33em;
     margin: 0 auto;
@@ -1015,7 +1049,7 @@ changes.
     background-repeat: no-repeat;
     background-size: contain;
     background-position: center;
-    background-image: url('/assets/Dotted_crotchet_rest.svg');
+    background-image: url("/<<assets-directory-name>>/<<assets-rest>>");
     height: 21px;
     margin: 4em 0;
   }
@@ -1109,7 +1143,12 @@ changes.
 
 A nice [[https://commons.wikimedia.org/wiki/File:Dotted_crotchet_rest.svg][rest symbol]] I found on the Wikimedia.
 
-#+begin_src xml :tangle ./build/assets/Dotted_crotchet_rest.svg
+#+name: assets-rest
+#+begin_src org
+  Dotted_crotchet_rest.svg
+#+end_src
+
+#+begin_src xml :tangle (jour-tangle-assets-filename "assets-rest" t)
   <?xml version="1.0" encoding="UTF-8" standalone="no"?>
   <!-- Created with Inkscape (http://www.inkscape.org/) -->
   <svg xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:svg="http://www.w3.org/2000/svg" xmlns="http://www.w3.org/2000/svg" xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="48px" height="48px" id="svg3010" version="1.1" inkscape:version="0.48.4 r9939" sodipodi:docname="Dotted_crotchet_rest.svg">
@@ -1145,7 +1184,12 @@ A nice [[https://commons.wikimedia.org/wiki/File:Le_Cabinet_de_Lampsaque,_1784_-
 to an SVG file, making its color a bit faded to look more like from a
 quaint book.
 
-#+begin_src xml :tangle ./build/assets/fleuron.svg
+#+name: assets-fleuron
+#+begin_src org
+  fleuron.svg
+#+end_src
+
+#+begin_src xml :tangle (jour-tangle-assets-filename "assets-fleuron" t)
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 247 322" width="247" height="322" aria-hidden="true">
     <defs>
       <filter id="softWear" x="-4%" y="-4%" width="108%" height="108%">
