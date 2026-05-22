@@ -11,7 +11,7 @@ better at Haskell and therefore this avenue would take 36 months at
 minimum
 #+end_quote
 
-So I built my own blog. But not in Haskell. (sorry Haskell, 'cause I
+So I built my own blog. But not in Haskell. (sorry Haskell, ’cause I
 don't know you and I don't have 36 months.) Actually, come to think of
 it, I'm not familiar with Elisp either…
 
@@ -89,23 +89,38 @@ remove the space if one of the characters is a CJK character.
     (format "<pre>%s</pre>"
             (org-html-encode-plain-text (org-export-format-code-default example-element info))))
 
-  (defun jour-html-footnote-reference (footnote-reference-element contents info)
+  (defun jour--next-footnote-reference-count (label info)
+    "Return the next occurrence index for a footnote LABEL in case of multiple
+  footnotes pointing to the same definition."
+    (let* ((counters (or (plist-get info :jour-footnote-reference-counters)
+                         (let ((table (make-hash-table :test #'equal)))
+                           (plist-put info :jour-footnote-reference-counters table)
+                           table)))
+           (count (gethash label counters 0)))
+      (puthash label (1+ count) counters)
+      count))
+
+  (defun jour-html-footnote-reference (footnote-reference-element _contents info)
     "Return HTML string for footnote reference.
 
   If the post is in the index page, the reference will point to the
   corresponding definition in the post page."
-    (let* ((id (org-element-property :label footnote-reference-element))
-           (def-id (format "#fn.%s" id))
+    (let* ((label (org-element-property :label footnote-reference-element))
+           (count (jour--next-footnote-reference-count label info))
+           (ref-id-suffix (if (= count 0) label (format "%s.%s" label count)))
+           (def-id (format "#fn.%s" label))
            (post (plist-get info :post-metadata))
-           (href (if (plist-get info :index-page-p)
+           (index-page-p (plist-get info :index-page-p))
+           (href (if index-page-p
                      (format "%s%s" (jour-post-url post) def-id)
-                     def-id)))
+                   def-id)))
       (jour-dom-to-html
        `(sup
          ()
          (a
-          ((id . ,(format "fnr.%s" id)) (href . ,href))
-          ,id)))))
+          (,@(if index-page-p '() `((id . ,(format "fnr.%s" ref-id-suffix))))
+           (href . ,href))
+          ,label)))))
 
   (defun jour-html-headline (headline-element contents info)
     (let* ((level (org-element-property :level headline-element))
@@ -380,9 +395,9 @@ hook, and it would work in Org's own HTML export, I suppose.
       ,(jour-dom-post-nav (jour-post-prev-post post) (jour-post-next-post post))))
 
   (defun jour-dom-footnote-definitions (info)
-    "Return a DOM tree for footnote definitions. `INFO' is the plist
-  passed around during Org export process, e.g. the second argument
-  to `jour-html-template', `EXT-PLIST' to org-export-*."
+    "Return a DOM tree for footnote definitions. INFO is the plist passed
+  around during Org export process, e.g. the second argument to
+  `jour-html-template', or EXT-PLIST to org-export-*."
     (let* ((definitions (org-export-collect-footnote-definitions info))
            (footnotes-dom (mapcar
                            (lambda (definition)
@@ -1224,3 +1239,4 @@ quaint book.
   style, ~i~ and ~em~ for italics, ~b~ and ~strong~ for bold. They
   have different semantics. Can I make Org to output them accordingly?
 - [ ] 标点挤压
+- [ ] Inline footnote
