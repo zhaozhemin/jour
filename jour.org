@@ -726,7 +726,7 @@ changes.
     `(item
       ()
       ,@(if (jour-post-microp post) nil `((title () ,(jour-post-title post))))
-      (description () ,(org-html-encode-plain-text (jour-export-post-body post)))
+      (description () ,(jour-export-post-body post))
       (guid () ,(concat "https://jour.kitschy.moe" (jour-post-url post)))
       (pubDate () ,(jour-format-rss-time (jour-post-date post)))))
 
