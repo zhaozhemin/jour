@@ -1,5 +1,5 @@
 # -*- mode: org -*-
-#+PROPERTY: header-args:emacs-lisp :lexical t :results silent
+#+PROPERTY: header-args:emacs-lisp :lexical t :results silent :tangle jour.el
 
 Nintendo .DS_Store (@sliminality) on [[https://x.com/sliminality/status/1336062001194229765][writing a blog post]]:
 
@@ -888,6 +888,10 @@ I put it in a separate block here.
         jour-css-url "/<<assets-directory-name>>/style.css")
 #+end_src
 
+#+begin_src emacs-lisp
+  (provide 'jour)
+#+end_src
+
 * Deployment
 
 #+name: deploy
@@ -1227,7 +1231,7 @@ quaint book.
 
 * To do or not to do, that is the question
 
-- [ ] For now, I just ~org-babel-load-file~ this file in my init file.
+- [X] For now, I just ~org-babel-load-file~ this file in my init file.
   This slows down the startup process. I need to tangle the main code
   into a separate file and lazy load it.
 - [ ] Web font
@@ -1240,3 +1244,9 @@ quaint book.
   have different semantics. Can I make Org to output them accordingly?
 - [ ] 标点挤压
 - [ ] Inline footnote
+
+* Local variables
+
+# Local Variables:
+# eval: (add-hook 'after-save-hook (lambda () (org-babel-tangle nil nil "emacs-lisp")) nil t)
+# End:
