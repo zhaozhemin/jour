@@ -220,7 +220,7 @@ remove the space if one of the characters is a CJK character.
       (jour-render-post-page-layout
        (jour-render-post contents post 'post info)
        (if updated
-           (ignore-errors (format " Last update at %s." (format-time-string "%b %-d, %Y" updated))))
+           (ignore-errors (format " Last updated at %s." (format-time-string "%b %-d, %Y" updated))))
        post)))
 #+end_src
 
@@ -966,6 +966,10 @@ I put it in a separate block here.
     margin: 0.5em auto;
   }
 
+  sup {
+    line-height: 0;
+  }
+
   img {
     display: block;
     max-width: 100%;
@@ -1020,6 +1024,20 @@ I put it in a separate block here.
     ol, ul {
       list-style-type: revert;
       padding-left: 3em;
+    }
+
+    #footnotes {
+      display: flex;
+      flex-direction: column;
+      gap: var(--paragraph-spacing);
+
+      [id^="fn."] > p:nth-of-type(1) {
+        display: inline;
+      }
+
+      p {
+        margin: var(--paragraph-spacing) 0;
+      }
     }
   }
 
@@ -1139,10 +1157,6 @@ I put it in a separate block here.
 
   .text-center {
     text-align: center;
-  }
-
-  [id^="fn."] > p:nth-of-type(1) {
-    display: inline;
   }
 
   .visually-hidden {
